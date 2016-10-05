@@ -1,0 +1,33 @@
+global
+    log logs4.papertrailapp.com:35147   local0
+    log-send-hostname
+
+defaults
+    log global
+    option httplog
+    option dontlognull
+    mode http
+    timeout connect 5000
+    timeout client  50000
+    timeout server  50000
+
+frontend http-active
+    bind *:80
+    use_backend {{if eq (key "app/active") "green"}}green{{else}}blue{{end}}
+
+
+frontend http-passive
+    bind *:8080
+    use_backend {{if eq (key "app/active") "green"}}blue{{else}}green{{end}}
+
+backend green
+    mode http
+    balance roundrobin
+    option forwardfor{{range $index, $app := service "green.app"}}
+    server host{{$index}} {{$app.NodeAddress}}:{{$app.Port}}{{end}}
+
+backend blue
+    mode http
+    balance roundrobin
+    option forwardfor{{range $index, $app := service "blue.app"}}
+    server host{{$index}} {{$app.NodeAddress}}:{{$app.Port}}{{end}}

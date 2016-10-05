@@ -1,0 +1,7 @@
+consul = "registry.service.consul:8500"
+
+template {
+  source = "/etc/haproxy/haproxy.ctmpl"
+  destination = "/etc/haproxy/haproxy.conf"
+  command = "haproxy -f /etc/haproxy/haproxy.conf -sf $(pidof haproxy) &"
+}

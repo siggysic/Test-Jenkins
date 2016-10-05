@@ -1,0 +1,370 @@
+#!/bin/bash
+
+
+DIR="$( cd "$( dirname "${BASH_SOURCE[0]}" )" && pwd )"
+CREATE_DM_OPTS="--virtualbox-memory 512"
+
+function init() {
+  while getopts ":n:p:d:" opt; do
+    case $opt in
+      n)
+        NAME=${OPTARG}
+        ;;
+      p)
+        HTTP_PORT=${OPTARG}
+        ;;
+      d)
+        DEBUG_PORT=${OPTARG}
+        ;;
+      *)
+        echo "Unkown flag -${OPTARG}"
+    esac
+  done
+  docker run -d \
+    --name ${NAME:?"Need to set a name with -n"} \
+    -v "${DIR}/target/webapp":/var/lib/jetty/webapps/ROOT \
+    --expose 8080 \
+    ${DEBUG_PORT:+--expose $DEBUG_PORT} \
+    ${DEBUG_PORT:+--expose 1898} \
+    -p ${HTTP_PORT:-8080}:8080 \
+    ${DEBUG_PORT:+-p ${DEBUG_PORT}:${DEBUG_PORT}} \
+    ${DEBUG_PORT:+-p 1898:1898} \
+    jetty \
+    "java ${DEBUG_PORT:+"-agentlib:jdwp=transport=dt_socket,server=y,suspend=n,address=$DEBUG_PORT -Dcom.sun.management.jmxremote.rmi.port=1898"} \
+        -Djava.io.tmpdir=/tmp/jetty -jar /usr/local/jetty/start.jar"
+}
+
+function swarm_env() {
+  IP=$(docker-machine ip manager)
+  docker-machine env manager
+  echo "declare -x DOCKER_HOST=\"tcp://$IP:3376\""
+}
+
+function consul_init() {
+  MACHINE=$1; IP=$2; MASTER_IP=$3
+  if [ "$IP" == "$MASTER_IP" ]; then
+    LAST_FLAG="-bootstrap"
+  else
+     LAST_FLAG="-join $MASTER_IP"
+  fi
+  docker run -d --name consul \
+      --restart=always \
+      -h $MACHINE \
+  		-p $IP:8300:8300 \
+  		-p $IP:8301:8301 \
+  		-p $IP:8301:8301/udp \
+  		-p $IP:8302:8302 \
+  		-p $IP:8302:8302/udp \
+  		-p $IP:8400:8400 \
+  		-p $IP:8500:8500 \
+  		-p $IP:53:53 \
+  		-p $IP:53:53/udp \
+  		progrium/consul \
+  		-server \
+  		-advertise $IP \
+  		$LAST_FLAG
+}
+
+function registrator_init() {
+  MACHINE=$1; IP=$2;
+  docker run -d \
+    --restart=always \
+  	-v /var/run/docker.sock:/tmp/docker.sock \
+  	-h $MACHINE \
+  	--name registrator \
+  	gliderlabs/registrator \
+  	consul://$IP:8500
+}
+
+function swarm_manager_init() {
+  MASTER_IP=$1
+  docker run -d -p 3376:3376 \
+    --restart=always \
+    --name swarm-manager \
+    -h manager \
+    -v /var/lib/boot2docker:/var/lib/certs:ro \
+    swarm manage \
+    -H 0.0.0.0:3376 \
+    --advertise $MASTER_IP:3376 \
+    --tls \
+    --tlsverify \
+    --tlscacert=/var/lib/certs/ca.pem \
+    --tlscert=/var/lib/certs/server.pem \
+    --tlskey=/var/lib/certs/server-key.pem \
+    consul://$MASTER_IP:8500
+}
+
+function swarm_node_init() {
+  NODE=$1
+  IP=$2
+  MASTER_IP=$3
+  docker run -d \
+      --restart=always \
+      -h $NODE \
+      --name swarm-node \
+      swarm join \
+      --addr=$IP:2376 \
+      consul://$IP:8500
+}
+
+function swarm_create_registry() {
+  docker-machine create -d virtualbox $CREATE_DM_OPTS --engine-label lm.type=registry registry
+  eval "$(docker-machine env registry)"
+  REGISTRY_IP=$(docker-machine ip registry)
+  cp -f bootlocal.org bootlocal.sh
+  echo "mkdir -p $(pwd)" | tee -a bootlocal.sh
+  echo "mount -t vboxsf lms $(pwd)" | tee -a bootlocal.sh
+  echo "echo \"$REGISTRY_IP registry.service.consul\" | sudo tee -a /etc/hosts" | tee -a bootlocal.sh
+  setup_sharedfolder registry $REGISTRY_IP
+  consul_init registry $REGISTRY_IP $REGISTRY_IP
+  registrator_init registry $REGISTRY_IP
+  mkdir -p $DIR/registry/certs
+  if [ ! -f $DIR/registry/certs/registry.crt ]; then
+    openssl req \
+      -newkey rsa:4096 -nodes -sha256 -x509 \
+      -subj "/C=US/ST=Denial/L=Here/O=LiftMicroServices/CN=registry.service.consul" \
+      -days 3650 \
+      -keyout $DIR/registry/certs/registry.key \
+      -out $DIR/registry/certs/registry.crt
+  fi
+  docker run -d \
+      --restart=always \
+      -h registry.swarm \
+      -p $REGISTRY_IP:5000:5000 \
+      -v $DIR/registry:/var/lib/registry \
+      -v $DIR/registry/config.yml:/etc/docker/registry/config.yml \
+      --name registry \
+       registry:2
+}
+
+function copy_registry_cert() {
+  MACHINE=$1; REGISTRY_IP=$2
+  docker-machine ssh $MACHINE sudo "echo \"$REGISTRY_IP registry.service.consul\" | sudo tee -a /etc/hosts"
+  TARGET_DIR=/etc/docker/certs.d/registry.service.consul:5000
+  docker-machine ssh $MACHINE sudo mkdir -p $TARGET_DIR
+  docker-machine scp $DIR/registry/certs/registry.crt $MACHINE:
+  docker-machine ssh $MACHINE sudo mv registry.crt $TARGET_DIR/ca.crt
+  docker-machine ssh $MACHINE sudo /etc/init.d/docker restart
+}
+
+function setup_sharedfolder() {
+  docker-machine scp bootlocal.sh $MACHINE:
+  docker-machine ssh $MACHINE sudo mv bootlocal.sh /var/lib/boot2docker/bootlocal.sh
+  docker-machine stop $MACHINE
+  VBoxManage sharedfolder add $MACHINE --name lms --hostpath $(pwd) --automount
+  docker-machine start $MACHINE
+}
+
+function swarm_create_manager() {
+  REGISTRY_IP="$(docker-machine ip registry)"
+  docker-machine create -d virtualbox $CREATE_DM_OPTS \
+      --engine-opt dns=$REGISTRY_IP \
+      --engine-registry-mirror=https://registry.service.consul:5000 \
+      --engine-label lm.type=master \
+      manager
+  eval "$(docker-machine env manager)"
+  setup_sharedfolder manager $REGISTRY_IP
+  copy_registry_cert manager $REGISTRY_IP
+  MASTER_IP=$(docker-machine ip manager)
+  consul_init manager $MASTER_IP $REGISTRY_IP
+  registrator_init manager $MASTER_IP
+  swarm_manager_init $MASTER_IP
+}
+
+function swarm_create_node() {
+  NODE=$1; MASTER_IP=${2:-$(docker-machine ip manager)}
+  REGISTRY_IP="$(docker-machine ip registry)"
+  docker-machine create -d virtualbox $CREATE_DM_OPTS \
+      --engine-opt dns=$REGISTRY_IP \
+      --engine-registry-mirror https://registry.swarm:5000 \
+      --engine-label lm.type=node \
+      $NODE
+  eval "$(docker-machine env $NODE)"
+  setup_sharedfolder $NODE $REGISTRY_IP
+  copy_registry_cert $NODE $REGISTRY_IP
+  IP=$(docker-machine ip $NODE)
+  consul_init $NODE $IP $REGISTRY_IP
+  registrator_init $NODE $IP
+  swarm_node_init $NODE $IP $MASTER_IP
+}
+
+function swarm_create() {
+  CREATE_TYPE=$1
+  case "${CREATE_TYPE}" in
+      registry)
+        shift
+        swarm_create_registry $@
+        ;;
+      manager)
+        shift
+        swarm_create_manager $@
+        ;;
+      *)
+        swarm_create_node $@
+  esac
+}
+
+function swarm_publish() {
+ while getopts ":n:v:" opt; do
+    case $opt in
+      n)
+        NAME=${OPTARG}
+        ;;
+      v)
+        VERSION=${OPTARG}
+        ;;
+      *)
+        echo "Unkown flag -${OPTARG}"
+    esac
+  done
+  sbt clean && sbt webappPrepare
+  eval "$(docker-machine env manager)"
+  REGISTRY_IP="$(docker-machine ip registry)"
+  docker build -t ${NAME:?"Need to set a name with -n"}:${VERSION:?"Need to provide a version with -v"} .
+  docker tag $NAME:$VERSION registry.service.consul:5000/$NAME:$VERSION
+  docker push registry.service.consul:5000/$NAME:$VERSION
+}
+
+function swarm_deploy() {
+ while getopts ":n:v:c:g:" opt; do
+    case $opt in
+      n)
+        NAME=${OPTARG}
+        ;;
+      v)
+        VERSION=${OPTARG}
+        ;;
+      c)
+        COUNT=${OPTARG}
+        ;;
+      g)
+        GROUP=${OPTARG}
+        ;;
+      *)
+        echo "Unkown flag -${OPTARG}"
+    esac
+  done
+  eval "$(swarm_env)"
+  for ((i = 1; i <= $COUNT; i++)); do
+    docker run -d -P \
+        -e "LiftMicroservicesGroup=${GROUP:?"Must specify blue or green with -g"}" \
+        -e "LiftMicroservicesName=${NAME:?"Need to set a name with -n"}" \
+        -e "LiftMicroservicesVersion=${VERSION:?"Need to provide a version with -v"}" \
+        -l SERVICE_TAGS=${GROUP} \
+        registry.service.consul:5000/${NAME}:${VERSION}
+  done
+}
+
+function swarm_undeploy() {
+  eval "$(swarm_env)"
+  IDS="$(docker ps -f "label=SERVICE_TAGS=$1" -q -a)"
+  if [ ! -z "$IDS" ]; then
+    docker stop $IDS
+    docker rm $IDS
+  fi
+}
+
+function swarm_activate() {
+  GROUP=$1; shift;
+  curl -X PUT -d "$GROUP" http://$(docker-machine ip registry):8500/v1/kv/app/active
+}
+
+function swarm_active() {
+  curl http://$(docker-machine ip registry):8500/v1/kv/app/active?raw; echo
+}
+
+function swarm_lb_build() {
+ cd $DIR/haproxy
+ docker build -t lb .
+}
+
+function swarm_lb_run() {
+  docker run -d --name lb \
+        -p 80:80 \
+        -p 8080:8080 \
+        -v $DIR/haproxy:/etc/haproxy \
+        lb
+}
+
+function swarm_lb() {
+  eval $(docker-machine env manager)
+  docker start lb || \
+    swarm_lb_run || \
+    (swarm_lb_build && swarm_lb_run)
+}
+
+
+function swarm_init() {
+  swarm_create_registry
+  swarm_create_manager
+  swarm_create node1
+  swarm_create node2
+  swarm_lb
+  swarm_activate "blue"
+}
+
+function swarm_destroy() {
+  if [ -z $1 ]; then
+    SWARM_NODES=("manager" "registry" "node1" "node2")
+  else
+    SWARM_NODES=("$@")
+  fi
+  for NODE in "${SWARM_NODES[@]}"; do
+    docker-machine stop $NODE
+    docker-machine rm -y $NODE
+  done
+}
+
+function swarm() {
+  SWARM_COMMAND=$1; shift
+  case "${SWARM_COMMAND}" in
+    init)
+      swarm_init $@
+      ;;
+    create)
+      swarm_create $@
+      ;;
+    destroy)
+      swarm_destroy $@
+      ;;
+    env)
+      swarm_env $@
+      ;;
+    publish)
+      swarm_publish $@
+      ;;
+    deploy)
+      swarm_deploy $@
+      ;;
+    undeploy)
+      swarm_undeploy $@
+      ;;
+    activate)
+      swarm_activate $@
+      ;;
+    active)
+      swarm_active $@
+      ;;
+    lb)
+      swarm_lb $@
+      ;;
+    *)
+      echo "Incorrect usage, see script for options"
+      exit 1
+  esac
+}
+
+COMMAND=$1; shift
+case "${COMMAND}" in
+  init)
+    init $@
+    ;;
+  swarm)
+    swarm $@
+    ;;
+  *)
+    echo "Incorrect usage, see script for options"
+    exit 1
+esac
+
+exit 0
